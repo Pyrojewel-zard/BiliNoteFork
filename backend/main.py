@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from app import create_app
 from app.db.video_task_dao import init_video_task_table
 from app.transcriber.transcriber_provider import get_transcriber
+from events import register_handler
 from ffmpeg_helper import ensure_ffmpeg_or_raise
 
 load_dotenv()
@@ -26,15 +27,13 @@ if not os.path.exists(out_dir):
 app = create_app()
 app.mount(static_path, StaticFiles(directory=static_dir), name="static")
 
+async def startup_event():
+    register_handler()
 @app.on_event("startup")
-def check_env():
+async def startup_event():
+    register_handler()
     ensure_ffmpeg_or_raise()
-@app.on_event("startup")
-async def load_model_on_startup():
     get_transcriber()
-
-@app.on_event("startup")
-def startup():
     init_video_task_table()
 
 if __name__ == "__main__":

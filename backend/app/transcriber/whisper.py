@@ -6,6 +6,8 @@ from app.transcriber.base import Transcriber
 from app.utils.env_checker import is_cuda_available, is_torch_installed
 from app.utils.path_helper import get_model_dir
 
+from events import transcription_finished
+
 '''
  Size of the model to use (tiny, tiny.en, base, base.en, small, small.en, distil-small.en, medium, medium.en, distil-medium.en, large-v1, large-v2, large-v3, large, distil-large-v2, distil-large-v3, large-v3-turbo, or turbo
 '''
@@ -64,29 +66,37 @@ class WhisperTranscriber(Transcriber):
 
     @timeit
     def transcript(self, file_path: str) -> TranscriptResult:
+        try:
 
-        segments_raw, info = self.model.transcribe(file_path)
+            segments_raw, info = self.model.transcribe(file_path)
 
-        segments = []
-        full_text = ""
+            segments = []
+            full_text = ""
 
-        for seg in segments_raw:
-            text = seg.text.strip()
-            full_text += text + " "
-            segments.append(TranscriptSegment(
-                start=seg.start,
-                end=seg.end,
-                text=text
-            ))
+            for seg in segments_raw:
+                text = seg.text.strip()
+                full_text += text + " "
+                segments.append(TranscriptSegment(
+                    start=seg.start,
+                    end=seg.end,
+                    text=text
+                ))
 
-        return TranscriptResult(
-            language=info.language,
-            full_text=full_text.strip(),
-            segments=segments,
-            raw=info
-        )
+            result= TranscriptResult(
+                language=info.language,
+                full_text=full_text.strip(),
+                segments=segments,
+                raw=info
+            )
+            self.on_finish(file_path, result)
+            return result
+        except Exception as e:
+            print(f"转写失败：{e}")
 
 
-if __name__ == '__main__':
-    print(WhisperTranscriber(cpu_threads=8).transcript(
-        '''D:\\data_backup_from_ssd\\02_个人项目\\11_BiliNote\\backend\\data\\BV1vcZ5YQE9X.mp3'''))
+    def on_finish(self,video_path:str,result: TranscriptResult)->None:
+        print("转写完成")
+        transcription_finished.send({
+            "file_path": video_path,
+        })
+
