@@ -159,9 +159,9 @@ class NoteGenerator:
         # 1. 选择下载器
         downloader = self.get_downloader(platform)
         gpt = self.get_gpt()
-        logger.info(f'使用{downloader.__class__.__name__}下载器\n'
-                    f'使用{gpt.__class__.__name__}GPT\n'
-                    f'视频地址：{video_url}')
+        logger.info(f'使用{downloader.__class__.__name__}下载器')
+        logger.info(f'使用{gpt.__class__.__name__}GPT')
+        logger.info(f'视频地址：{video_url}')
         if screenshot:
 
             video_path = downloader.download_video(video_url)
