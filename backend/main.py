@@ -3,13 +3,14 @@ import os
 import uvicorn
 from starlette.staticfiles import StaticFiles
 from dotenv import load_dotenv
-
+from app.utils.logger import get_logger
 from app import create_app
 from app.db.video_task_dao import init_video_task_table
 from app.transcriber.transcriber_provider import get_transcriber
 from events import register_handler
 from ffmpeg_helper import ensure_ffmpeg_or_raise
 
+logger = get_logger(__name__)
 load_dotenv()
 
 # 读取 .env 中的路径
@@ -38,6 +39,6 @@ async def startup_event():
 
 if __name__ == "__main__":
     port = int(os.getenv("BACKEND_PORT", 8000))
-
     host = os.getenv("BACKEND_HOST", "0.0.0.0")
+    logger.info(f"Starting server on {host}:{port}")
     uvicorn.run("main:app", host=host, port=port, reload=True)

@@ -28,13 +28,15 @@ from app.utils.video_helper import generate_screenshot
 # from app.services.whisperer import transcribe_audio
 # from app.services.gpt import summarize_text
 from dotenv import load_dotenv
-
+from app.utils.logger import get_logger
+logger = get_logger(__name__)
 load_dotenv()
 BACKEND_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 
 output_dir = os.getenv('OUT_DIR')
 image_base_url = os.getenv('IMAGE_BASE_URL')
-print(output_dir)
+logger.info("starting up")
+
 
 
 class NoteGenerator:
@@ -47,25 +49,35 @@ class NoteGenerator:
 
         self.provider = os.getenv('MODEl_PROVIDER','openai')
         self.video_path = None
+        logger.info("初始化NoteGenerator")
+
 
     def get_gpt(self) -> GPT:
         if self.provider == 'openai':
+            logger.info("使用OpenAI")
             return OpenaiGPT()
         elif self.provider == 'deepSeek':
+            logger.info("使用DeepSeek")
             return DeepSeekGPT()
         elif self.provider == 'qwen':
+            logger.info("使用Qwen")
             return QwenGPT()
         else:
+            logger.warning("不支持的AI提供商")
             raise ValueError(f"不支持的AI提供商：{self.provider}")
 
     def get_downloader(self, platform: str) -> Downloader:
         if platform == "bilibili":
+            logger.info("下载 Bilibili 平台视频")
             return BilibiliDownloader()
         elif platform == "youtube":
+            logger.info("下载 YouTube 平台视频")
             return YoutubeDownloader()
         elif platform == 'douyin':
+            logger.info("下载 Douyin 平台视频")
             return DouyinDownloader()
         else:
+            logger.warning("不支持的平台")
             raise ValueError(f"不支持的平台：{platform}")
 
     def get_transcriber(self) -> Transcriber:
@@ -75,11 +87,14 @@ class NoteGenerator:
         :return:
         '''
         if self.transcriber_type == 'fast-whisper':
+            logger.info("使用Whisper")
             return get_transcriber()
         else:
+            logger.warning("不支持的转义器")
             raise ValueError(f"不支持的转义器：{self.transcriber}")
 
     def save_meta(self, video_id, platform, task_id):
+        logger.info(f"记录已经生成的数据信息")
         insert_video_task(video_id=video_id, platform=platform, task_id=task_id)
 
     def insert_screenshots_into_markdown(self, markdown: str, video_path: str, image_base_url: str,
@@ -91,18 +106,23 @@ class NoteGenerator:
         """
         matches = self.extract_screenshot_timestamps(markdown)
         new_markdown = markdown
+        logger.info(f"开始为笔记生成截图")
+        try:
+            for idx, (marker, ts) in enumerate(matches):
+                image_path = generate_screenshot(video_path, output_dir, ts, idx)
+                image_relative_path = os.path.join(image_base_url, os.path.basename(image_path)).replace("\\", "/")
+                image_url = f"{BACKEND_BASE_URL.rstrip('/')}/{image_relative_path.lstrip('/')}"
+                replacement = f"![]({image_url})"
+                new_markdown = new_markdown.replace(marker, replacement, 1)
 
-        for idx, (marker, ts) in enumerate(matches):
-            image_path = generate_screenshot(video_path, output_dir, ts, idx)
-            image_relative_path = os.path.join(image_base_url, os.path.basename(image_path)).replace("\\", "/")
-            image_url = f"{BACKEND_BASE_URL.rstrip('/')}/{image_relative_path.lstrip('/')}"
-            replacement = f"![]({image_url})"
-            new_markdown = new_markdown.replace(marker, replacement, 1)
-
-        return new_markdown
+            return new_markdown
+        except Exception as e:
+            logger.error(f"截图生成失败：{e}")
+            raise e
 
     @staticmethod
     def delete_note(video_id: str, platform: str):
+        logger.info(f"删除生成的笔记记录")
         return delete_task_by_video(video_id, platform)
 
     import re
@@ -112,6 +132,7 @@ class NoteGenerator:
         从 Markdown 中提取 Screenshot 时间标记（如 *Screenshot-03:39 或 Screenshot-[03:39]），
         并返回匹配文本和对应时间戳（秒）
         """
+        logger.info(f"开始提取截图时间标记")
         pattern = r"(?:\*Screenshot-(\d{2}):(\d{2})|Screenshot-\[(\d{2}):(\d{2})\])"
         matches = list(re.finditer(pattern, markdown))
         results = []
@@ -134,12 +155,15 @@ class NoteGenerator:
             path: Union[str, None] = None
 
     ) -> NoteResult:
-
+        logger.info(f"开始解析并生成笔记")
         # 1. 选择下载器
         downloader = self.get_downloader(platform)
         gpt = self.get_gpt()
-
+        logger.info(f'使用{downloader.__class__.__name__}下载器\n'
+                    f'使用{gpt.__class__.__name__}GPT\n'
+                    f'视频地址：{video_url}')
         if screenshot:
+
             video_path = downloader.download_video(video_url)
             self.video_path = video_path
             print(video_path)
@@ -152,10 +176,10 @@ class NoteGenerator:
             need_video=screenshot
 
         )
-
+        logger.info(f"下载音频成功，文件路径：{audio.file_path}")
         # 3. Whisper 转写
         transcript: TranscriptResult = self.transcriber.transcript(file_path=audio.file_path)
-
+        logger.info(f"Whisper 转写成功，转写结果：{transcript.full_text}")
         # 4. GPT 总结
         source = GPTSource(
             title=audio.title,
@@ -164,6 +188,7 @@ class NoteGenerator:
             screenshot=screenshot,
             link=link
         )
+        logger.info(f"GPT 总结完成，总结结果：{source}")
         markdown: str = gpt.summarize(source)
         print("markdown结果", markdown)
 
@@ -179,6 +204,3 @@ class NoteGenerator:
         )
 
 
-if __name__ == '__main__':
-    note = NoteGenerator()
-    print(note.audio_meta)
