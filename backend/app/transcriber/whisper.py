@@ -47,6 +47,7 @@ class WhisperTranscriber(Transcriber):
                 print('没有 cuda 使用 cpu进行计算')
 
         self.compute_type = compute_type or ("float16" if self.device == "cuda" else "int8")
+        logger.info(f"Whisper 初始化: device={self.device}, compute_type={self.compute_type}")
 
         model_dir = get_model_dir("whisper")
         model_path = os.path.join(model_dir, f"whisper-{model_size}")

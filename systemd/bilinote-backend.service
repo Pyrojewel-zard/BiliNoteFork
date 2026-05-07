@@ -1,0 +1,17 @@
+[Unit]
+Description=BiliNote Backend (FastAPI + CUDA Whisper)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/DataTransfer/Pyrojewel/vscode/BiliNoteFork/backend
+Environment=PATH=/home/RFRL26/miniconda3/envs/bilinote5090/bin:/home/RFRL26/miniconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=LD_LIBRARY_PATH=/home/RFRL26/miniconda3/envs/bilinote5090/lib/python3.10/site-packages/ctranslate2.libs:/home/RFRL26/miniconda3/envs/bilinote5090/lib/python3.10/site-packages/nvidia/cudnn/lib:%L
+ExecStart=/home/RFRL26/miniconda3/envs/bilinote5090/bin/python main.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/tmp/bilinote-backend.log
+StandardError=append:/tmp/bilinote-backend.log
+
+[Install]
+WantedBy=default.target

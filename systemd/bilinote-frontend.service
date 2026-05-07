@@ -1,0 +1,16 @@
+[Unit]
+Description=BiliNote Frontend (Vite Dev Server)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/DataTransfer/Pyrojewel/vscode/BiliNoteFork/BillNote_frontend
+Environment=PATH=/home/RFRL26/.nvm/versions/node/v20.20.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStart=/home/RFRL26/.nvm/versions/node/v20.20.0/bin/pnpm dev
+Restart=always
+RestartSec=5
+StandardOutput=append:/tmp/bilinote-frontend.log
+StandardError=append:/tmp/bilinote-frontend.log
+
+[Install]
+WantedBy=default.target
