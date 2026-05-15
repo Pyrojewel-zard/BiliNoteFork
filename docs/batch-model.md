@@ -1197,9 +1197,624 @@ Task 3:       UPLOAD → PROCESS → SUCCESS
 - [x] 已完成判断基于本地输出产物，不依赖远端状态
 - [x] 同名文件冲突有明确处理策略（哈希后缀）
 
+## 13.5 批量执行策略验收清单（第 14 节）
+
+- [x] 定义 V1 顺序执行策略（默认并发=1）
+- [x] 定义 V2 有限并发策略（默认并发=2，最大=4）
+- [x] 定义失败重试策略（单任务级，不影响批次继续）
+- [x] 定义重试触发条件和指数退避
+- [x] 定义结果即时落地策略（每个任务完成后立即保存）
+- [x] 定义增量批次摘要更新
+- [x] 定义断点续传机制
+- [x] 定义 JSON Summary 格式（机器可读）
+- [x] 定义 Markdown Summary 格式（人类可读）
+- [x] 即使批量中途失败，也能知道已完成的文件、失败的文件、未开始的文件
+
 ---
 
-## 14. 后续扩展
+## 14. 批量执行策略
+
+本节定义批量任务的执行策略，确保批次执行的可靠性、可恢复性和可观测性。
+
+### 14.1 版本演进策略
+
+#### 14.1.1 V1：顺序执行（默认）
+
+**设计原则**：简单可靠，优先保证正确性。
+
+| 配置项 | V1 默认值 | 说明 |
+|--------|----------|------|
+| `--concurrency` | 1 | 串行执行，一个任务完成后再启动下一个 |
+| 失败处理 | 继续执行 | 单任务失败不影响后续任务 |
+| 重试策略 | 单任务级 | 失败任务在批次结束后统一重试 |
+
+**执行流程**：
+
+```
+Task 1: PENDING → UPLOADING → PROCESSING → SUCCESS/FAILED
+                                                          ↓ (完成后立即落地)
+Task 2: PENDING → UPLOADING → PROCESSING → SUCCESS/FAILED
+                                                          ↓ (完成后立即落地)
+Task 3: PENDING → UPLOADING → PROCESSING → SUCCESS/FAILED
+                                                          ↓ (完成后立即落地)
+...
+
+最后：生成 batch_summary.json + batch_summary.md
+```
+
+**优点**：
+- 实现简单，易于调试
+- 资源占用可控
+- 失败定位清晰
+- 不存在并发冲突
+
+**适用场景**：
+- 首次部署验证
+- 任务数量较少（< 50）
+- 服务端资源有限
+- 网络带宽受限
+
+#### 14.1.2 V2：有限并发（扩展）
+
+**设计原则**：保守起步，按需调优。
+
+| 配置项 | V2 默认值 | 说明 |
+|--------|----------|------|
+| `--concurrency` | 2 | 默认并发数，建议范围 1-4 |
+| 最大并发 | 4 | 硬上限，避免过载 |
+| 失败处理 | 继续执行 | 单任务失败不影响其他并发任务 |
+| 重试策略 | 延迟重试 | 失败任务放入重试队列，批次结束后重试 |
+
+**执行流程**：
+
+```
+         ┌─ Task 1: SUCCESS ──────────────────────┐
+         │                                         │
+时间线 ──┼─ Task 2: SUCCESS ──────────────────────┼──→ 完成
+         │                                         │
+         └─ Task 3: FAILED (重试队列) ────────────┘
+
+重试队列: [Task 3] → 重试 → SUCCESS/最终失败
+```
+
+**并发控制实现**：
+
+```python
+# 伪代码：并发控制
+function execute_batch_concurrent(tasks, concurrency):
+    semaphore = Semaphore(concurrency)
+    results = []
+
+    async def run_task(task):
+        async with semaphore:
+            return await execute_single_task(task)
+
+    # 启动所有任务，由信号量控制并发
+    results = await asyncio.gather(*[run_task(t) for t in tasks])
+
+    return results
+```
+
+**并发数推荐**：
+
+| 服务端配置 | 推荐并发数 | 说明 |
+|-----------|-----------|------|
+| 单核 / 2GB | 1 | 资源受限，串行为佳 |
+| 2核 / 4GB | 1-2 | 轻度并发 |
+| 4核 / 8GB | 2-3 | 中等并发 |
+| 8核+ / 16GB+ | 3-4 | 可充分利用 |
+
+**注意**：并发数过高可能导致：
+- 服务端 OOM（内存溢出）
+- API 限流
+- 上传带宽饱和
+- 任务失败率上升
+
+---
+
+### 14.2 失败重试策略
+
+#### 14.2.1 重试范围
+
+**原则**：重试仅对单文件任务生效，不影响全局批次继续执行。
+
+| 场景 | 重试行为 | 批次行为 |
+|------|----------|----------|
+| 单任务上传失败 | 计入重试队列 | 继续执行下一个任务 |
+| 单任务处理失败 | 计入重试队列 | 继续执行下一个任务 |
+| 单任务超时 | 计入重试队列 | 继续执行下一个任务 |
+| 批次整体超时 | 停止所有进行中任务 | 生成部分结果摘要 |
+| 网络完全中断 | 视为批次级失败 | 保存已落地结果 |
+
+#### 14.2.2 重试配置
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--retries` | 3 | 单任务最大重试次数 |
+| 重试延迟 | 指数退避 | 避免瞬时压力 |
+
+**指数退避策略**：
+
+```python
+# 重试延迟计算
+retry_delay = min(base_delay * (2 ** retry_count), max_delay)
+
+# 示例：base=5s, max=60s
+# 第 1 次重试: 5s
+# 第 2 次重试: 10s
+# 第 3 次重试: 20s
+```
+
+#### 14.2.3 重试触发条件
+
+| 错误类型 | 是否重试 | 原因 |
+|----------|----------|------|
+| 网络超时 | 是 | 临时性问题 |
+| 服务端 5xx | 是 | 服务端临时故障 |
+| 上传失败 | 是 | 可能是临时网络问题 |
+| 服务端 4xx（除 429） | 否 | 参数错误，重试无意义 |
+| 文件损坏 | 否 | 源文件问题，需人工介入 |
+| 格式不支持 | 否 | 源文件问题，需人工介入 |
+| API 限流 (429) | 是 | 等待后重试 |
+
+#### 14.2.4 重试队列处理
+
+**V1 实现**（批次结束后统一重试）：
+
+```python
+# 伪代码：V1 重试队列
+function execute_batch_v1(tasks):
+    pending_tasks = list(tasks)
+    retry_queue = []
+    completed_tasks = []
+
+    # 第一轮：顺序执行
+    for task in pending_tasks:
+        result = execute_single_task(task)
+        save_task_result(task, result)  # 立即落地
+
+        if result.status == "FAILED" and task.can_retry():
+            retry_queue.append(task)
+        else:
+            completed_tasks.append(task)
+
+    # 第二轮：重试失败任务
+    for task in retry_queue:
+        task.increment_retry()
+        result = execute_single_task(task)
+        save_task_result(task, result)  # 立即落地
+        completed_tasks.append(task)
+
+    # 生成批次摘要
+    save_batch_summary(completed_tasks)
+```
+
+**V2 实现**（延迟重试，支持并发）：
+
+```python
+# 伪代码：V2 重试队列
+function execute_batch_v2(tasks, concurrency):
+    pending_tasks = list(tasks)
+    retry_queue = []
+    max_retry_rounds = 3
+
+    for retry_round in range(max_retry_rounds):
+        if not pending_tasks:
+            break
+
+        # 并发执行
+        results = execute_concurrent(pending_tasks, concurrency)
+
+        # 分类结果
+        retry_queue = []
+        for task, result in results:
+            save_task_result(task, result)  # 立即落地
+
+            if result.status == "FAILED" and task.can_retry():
+                task.increment_retry()
+                retry_queue.append(task)
+
+        # 下一轮重试
+        pending_tasks = retry_queue
+
+    # 最终仍失败的任务
+    for task in retry_queue:
+        task.mark_failed("Exceeded max retries")
+
+    # 生成批次摘要
+    save_batch_summary(all_tasks)
+```
+
+---
+
+### 14.3 结果即时落地策略
+
+#### 14.3.1 核心原则
+
+**每个文件完成后立即落地结果与状态，避免批次中断导致所有结果丢失。**
+
+#### 14.3.2 落地时机
+
+| 任务状态 | 落地内容 | 落地时机 |
+|----------|----------|----------|
+| `UPLOADING` | `.meta.json`（含 remote_upload_url） | 上传完成后 |
+| `QUEUED` | `.meta.json`（含 remote_task_id） | 任务入队后 |
+| `PROCESSING` | `.meta.json`（状态更新） | 状态变更时 |
+| `SUCCESS` | `.md` + `.meta.json` (+ 可选 `.json/.txt`) | 任务成功后 |
+| `FAILED` | `.meta.json`（含 error_message） | 任务失败后 |
+| `TIMEOUT` | `.meta.json`（含 last_status） | 任务超时后 |
+| `SKIPPED` | `.meta.json`（含 reason） | 判断跳过后 |
+
+#### 14.3.3 落地实现
+
+```python
+# 伪代码：即时落地
+function save_task_result(task, result):
+    meta_path = Path(task.output_dir) / f"{task.basename}.meta.json"
+
+    # 原子写入：先写临时文件，再重命名
+    temp_path = meta_path.with_suffix(".tmp")
+    write_json(temp_path, task.to_dict())
+    rename(temp_path, meta_path)
+
+    # 成功时写入 Markdown
+    if result.status == "SUCCESS":
+        md_path = Path(task.output_dir) / f"{task.basename}.md"
+        write_file(md_path, result.markdown)
+
+        # 可选文件
+        if task.save_json:
+            write_json(md_path.with_suffix(".json"), result.full_result)
+        if task.save_transcript:
+            write_file(md_path.with_suffix(".txt"), result.transcript)
+
+    # 更新批次摘要（增量）
+    update_batch_summary_incremental(task)
+```
+
+#### 14.3.4 增量批次摘要
+
+每次任务完成后，增量更新 `batch_summary.json`：
+
+```python
+# 伪代码：增量更新批次摘要
+function update_batch_summary_incremental(completed_task):
+    summary_path = Path(output_dir) / "batch_summary.json"
+
+    # 读取现有摘要
+    if summary_path.exists():
+        summary = read_json(summary_path)
+    else:
+        summary = create_empty_summary()
+
+    # 更新统计
+    if completed_task.status == "SUCCESS":
+        summary["success"] += 1
+    elif completed_task.status == "FAILED":
+        summary["failed"] += 1
+        summary["failed_tasks"][completed_task.task_id] = completed_task.error_message
+    elif completed_task.status == "SKIPPED":
+        summary["skipped"] += 1
+        summary["skipped_tasks"][completed_task.task_id] = completed_task.error_message
+
+    summary["in_progress"] -= 1
+    summary["updated_at"] = datetime.utcnow().isoformat() + "Z"
+
+    # 原子写入
+    write_json_atomic(summary_path, summary)
+```
+
+#### 14.3.5 中断恢复能力
+
+**场景**：批次执行过程中被中断（Ctrl+C、进程终止、系统重启）。
+
+**恢复策略**：
+
+1. **重新运行相同命令**：
+   - 扫描输出目录，加载已存在的 `.meta.json`
+   - 根据状态判断：SUCCESS 跳过，FAILED/TIMEOUT 重试，其他状态重新执行
+   - 合并现有结果与新任务
+
+2. **断点续传实现**：
+
+```python
+# 伪代码：断点续传
+function resume_batch(input_dir, output_dir):
+    # 加载已有任务
+    existing_tasks = load_existing_tasks(output_dir)
+
+    # 扫描输入文件
+    video_files = scan_video_files(input_dir)
+
+    pending_tasks = []
+    for video_file in video_files:
+        if video_file in existing_tasks:
+            task = existing_tasks[video_file]
+
+            # 已成功：跳过
+            if task.status == "SUCCESS":
+                task.mark_skipped("Already completed")
+                continue
+
+            # 可重试：加入重试
+            if task.can_retry():
+                task.increment_retry()
+                pending_tasks.append(task)
+            else:
+                # 超过重试次数：标记失败
+                task.mark_failed("Exceeded max retries after resume")
+        else:
+            # 新任务
+            task = BatchTask(input_file=video_file, output_dir=output_dir)
+            pending_tasks.append(task)
+
+    return pending_tasks
+```
+
+---
+
+### 14.4 Summary 文件格式
+
+#### 14.4.1 设计原则
+
+1. **机器可读**：JSON 格式，支持程序解析和后续处理
+2. **人类可读**：Markdown 格式，便于快速浏览和存档
+3. **完整信息**：包含所有任务的最终状态和路径
+4. **可追溯**：记录批次配置和执行时间
+
+#### 14.4.2 JSON Summary 格式
+
+**文件路径**：`<output_dir>/batch_summary.json`
+
+```json
+{
+  "version": "1.0.0",
+  "batch_id": "uuid-string",
+  "created_at": "2026-05-15T10:00:00Z",
+  "updated_at": "2026-05-15T10:45:00Z",
+  "started_at": "2026-05-15T10:00:05Z",
+  "completed_at": "2026-05-15T10:45:00Z",
+  "duration_seconds": 2695.0,
+
+  "statistics": {
+    "total": 10,
+    "success": 8,
+    "failed": 1,
+    "skipped": 1,
+    "retried": 2
+  },
+
+  "configuration": {
+    "input_dir": "/data/videos",
+    "output_dir": "/data/notes",
+    "recursive": true,
+    "file_pattern": "*.mp4",
+    "concurrency": 1,
+    "max_retries": 3,
+    "style": "minimal",
+    "model": "gpt-4o",
+    "provider_id": "xxx-xxx-xxx"
+  },
+
+  "tasks": [
+    {
+      "task_id": "uuid-1",
+      "input_file": "/data/videos/video_01.mp4",
+      "output_basename": "video_01",
+      "status": "SUCCESS",
+      "retry_count": 0,
+      "duration_seconds": 52.3,
+      "markdown_path": "/data/notes/video_01.md",
+      "meta_path": "/data/notes/video_01.meta.json"
+    },
+    {
+      "task_id": "uuid-2",
+      "input_file": "/data/videos/video_02.mp4",
+      "output_basename": "video_02",
+      "status": "FAILED",
+      "retry_count": 3,
+      "duration_seconds": 12.5,
+      "error_message": "Upload timeout after 3 retries",
+      "meta_path": "/data/notes/video_02.meta.json"
+    }
+  ],
+
+  "failed_tasks": {
+    "uuid-2": "Upload timeout after 3 retries"
+  },
+
+  "skipped_tasks": {
+    "uuid-10": "Result already exists"
+  }
+}
+```
+
+#### 14.4.3 Markdown Summary 格式
+
+**文件路径**：`<output_dir>/batch_summary.md`
+
+```markdown
+# BiliNote 批量转录报告
+
+**批次 ID**: `batch-uuid-xxx`
+**执行时间**: 2026-05-15 10:00:05 ~ 10:45:00 (约 45 分钟)
+**命令**: `bilinote-cli batch /data/videos --recursive --style minimal`
+
+---
+
+## 统计摘要
+
+| 指标 | 数量 | 百分比 |
+|------|------|--------|
+| 总任务数 | 10 | 100% |
+| ✅ 成功 | 8 | 80% |
+| ❌ 失败 | 1 | 10% |
+| ⏭️ 跳过 | 1 | 10% |
+| 🔄 已重试 | 2 | - |
+
+---
+
+## 执行配置
+
+| 配置项 | 值 |
+|--------|-----|
+| 输入目录 | `/data/videos` |
+| 输出目录 | `/data/notes` |
+| 递归扫描 | 是 |
+| 文件模式 | `*.mp4` |
+| 并发数 | 1 |
+| 最大重试 | 3 |
+| 笔记风格 | minimal |
+| LLM 模型 | gpt-4o |
+
+---
+
+## ❌ 失败任务 (1)
+
+| 文件名 | 错误信息 | 重试次数 |
+|--------|----------|----------|
+| video_02.mp4 | Upload timeout after 3 retries | 3 |
+
+---
+
+## ⏭️ 跳过任务 (1)
+
+| 文件名 | 原因 |
+|--------|------|
+| video_10.mp4 | Result already exists |
+
+---
+
+## ✅ 成功任务 (8)
+
+| 文件名 | 输出路径 | 耗时 |
+|--------|----------|------|
+| video_01.mp4 | `/data/notes/video_01.md` | 52s |
+| video_03.mp4 | `/data/notes/video_03.md` | 48s |
+| video_04.mp4 | `/data/notes/video_04.md` | 55s |
+| video_05.mp4 | `/data/notes/video_05.md` | 50s |
+| video_06.mp4 | `/data/notes/video_06.md` | 47s |
+| video_07.mp4 | `/data/notes/video_07.md` | 51s |
+| video_08.mp4 | `/data/notes/video_08.md` | 49s |
+| video_09.mp4 | `/data/notes/video_09.md` | 53s |
+
+---
+
+## 执行日志
+
+```
+[10:00:05] [BiliNote] Batch transcription started
+[10:00:05]   Total: 10 files
+[10:00:05]   Output: /data/notes/
+[10:00:06] [01/10] video_01.mp4 - UPLOADING
+[10:00:15] [01/10] video_01.mp4 - PROCESSING
+[10:00:58] [01/10] video_01.mp4 - SUCCESS (52s)
+...
+[10:45:00] [BiliNote] Batch completed
+[10:45:00]   Success: 8
+[10:45:00]   Failed: 1
+[10:45:00]   Skipped: 1
+```
+
+---
+
+*报告生成时间: 2026-05-15 10:45:00*
+```
+
+#### 14.4.4 Summary 生成时机
+
+| 时机 | 操作 | 内容 |
+|------|------|------|
+| 批次开始 | 创建 `batch_summary.json` | 初始化配置和任务列表 |
+| 每个任务完成 | 增量更新 JSON | 更新统计和任务状态 |
+| 批次完成 | 生成 Markdown | 完整报告 |
+| 批次中断 | 保留现有 JSON | 支持断点续传 |
+
+---
+
+### 14.5 验收标准
+
+#### 14.5.1 核心验收点
+
+| 序号 | 验收项 | 验证方式 |
+|------|--------|----------|
+| 1 | 顺序执行正常 | 执行 3 个任务，验证按顺序逐个完成 |
+| 2 | 单任务失败不影响批次 | 手动制造失败，验证后续任务继续执行 |
+| 3 | 结果即时落地 | 任务完成后立即检查 `.meta.json` 和 `.md` |
+| 4 | 中断恢复 | 执行中途 Ctrl+C，重新运行验证断点续传 |
+| 5 | Summary 完整 | 检查 `batch_summary.json` 和 `.md` 包含所有任务 |
+| 6 | 失败任务可追溯 | 验证 `failed_tasks` 包含错误信息和重试次数 |
+
+#### 14.5.2 验收测试用例
+
+**用例 1: 正常批量执行**
+
+```bash
+bilinote-cli batch /data/test_videos --output-dir /tmp/test_output
+```
+
+**预期**:
+- 所有任务顺序完成
+- 每个任务生成 `.md` 和 `.meta.json`
+- 生成 `batch_summary.json` 和 `batch_summary.md`
+- `batch_summary.json` 统计正确
+
+**用例 2: 部分失败**
+
+```bash
+# 准备：包含一个损坏的视频文件
+bilinote-cli batch /data/mixed_videos --output-dir /tmp/test_output
+```
+
+**预期**:
+- 损坏文件任务失败，记录错误信息
+- 其他任务正常完成
+- `batch_summary.json` 中 `failed_tasks` 包含失败任务
+- 退出码 = 0（批次完成，即使有失败）
+
+**用例 3: 中断恢复**
+
+```bash
+# 第一次运行（中途 Ctrl+C）
+bilinote-cli batch /data/videos --output-dir /tmp/test_output
+# 执行 3/10 时中断
+
+# 第二次运行（断点续传）
+bilinote-cli batch /data/videos --output-dir /tmp/test_output
+```
+
+**预期**:
+- 第二次运行跳过已成功的 3 个任务
+- 继续执行剩余 7 个任务
+- 最终 `batch_summary.json` 包含全部 10 个任务
+
+**用例 4: 重试生效**
+
+```bash
+# 模拟：服务端临时不可用
+bilinote-cli batch /data/videos --retries 2
+```
+
+**预期**:
+- 失败任务重试最多 2 次
+- `.meta.json` 记录 `retry_count`
+- 重试成功后状态更新为 SUCCESS
+
+---
+
+### 14.6 设计决策记录
+
+| 决策 | 理由 |
+|------|------|
+| V1 默认并发=1 | 简单可靠，降低出错风险 |
+| 重试在批次结束后 | 简化实现，避免复杂状态管理 |
+| 即时落地而非批量保存 | 最大化数据保留，支持断点续传 |
+| 双格式 Summary | JSON 供程序解析，Markdown 供人工查阅 |
+| 批次退出码=0 即使有失败 | 批次"完成"与"全成功"分离，失败信息在 Summary 中 |
+
+---
+
+## 15. 后续扩展
 
 | 扩展项 | 说明 |
 |--------|------|
