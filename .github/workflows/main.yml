@@ -13,8 +13,6 @@ jobs:
         include:
           - platform: macos-latest
             target: universal-apple-darwin
-          - platform: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
 
@@ -23,13 +21,6 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-
-      # Linux 系统依赖（Tauri 需要）
-      - name: Install Linux Dependencies
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
       # 设置 Python 环境（带 pip 缓存）
       - name: Set up Python
@@ -54,10 +45,12 @@ jobs:
           fi
 
       # 设置 pnpm
+      # 不能用 'latest'：pnpm 11+ 要求 Node 22+，与下方 Node 20 不兼容（ERR_UNKNOWN_BUILTIN_MODULE）。
+      # lockfile 是 pnpm 9 生成；统一 pin 到 9.15.0
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 'latest'
+          version: '9.15.0'
 
       # 设置 Node 环境
       - name: Set up Node.js
@@ -86,6 +79,19 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('BillNote_frontend/src-tauri/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # 从 tag 注入版本号到 tauri.conf.json：Tauri 取该文件的静态 version 作为
+      # 产物版本，不同步的话构建产物会恒为 conf 里写死的值（此前的 2.0.0）。
+      # github.ref_name 形如 v2.3.2，去掉前缀 v。workflow_dispatch（无 tag）时跳过，保留静态值。
+      - name: Sync version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: BillNote_frontend
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Injecting version $VERSION into tauri.conf.json"
+          node -e "const f='src-tauri/tauri.conf.json'; const fs=require('fs'); const j=JSON.parse(fs.readFileSync(f,'utf8')); j.version=process.argv[1]; fs.writeFileSync(f, JSON.stringify(j,null,2)+'\n');" "$VERSION"
+          node -e "console.log('tauri.conf.json version =', require('./src-tauri/tauri.conf.json').version)"
+
       # 打包 Tauri 应用
       - name: Build Tauri App
         working-directory: BillNote_frontend
@@ -103,9 +109,6 @@ jobs:
           # Windows: .msi, .exe (NSIS)
           find "$BUNDLE_DIR" -name "*.msi" -exec cp {} release-artifacts/ \; 2>/dev/null || true
           find "$BUNDLE_DIR/nsis" -name "*.exe" -exec cp {} release-artifacts/ \; 2>/dev/null || true
-          # Linux: .deb, .AppImage
-          find "$BUNDLE_DIR" -name "*.deb" -exec cp {} release-artifacts/ \; 2>/dev/null || true
-          find "$BUNDLE_DIR" -name "*.AppImage" -exec cp {} release-artifacts/ \; 2>/dev/null || true
 
           echo "=== Collected artifacts ==="
           ls -lh release-artifacts/

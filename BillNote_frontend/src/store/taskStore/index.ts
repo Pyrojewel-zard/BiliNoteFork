@@ -1,8 +1,9 @@
 import { create } from 'zustand'
-import { persist } from 'zustand/middleware'
+import { persist, createJSONStorage } from 'zustand/middleware'
 import { delete_task, generateNote } from '@/services/note.ts'
 import { v4 as uuidv4 } from 'uuid'
 import toast from 'react-hot-toast'
+import { get, set, del } from 'idb-keyval'
 
 
 export type TaskStatus = 'PENDING' | 'RUNNING' | 'SUCCESS' | 'FAILD'
@@ -168,10 +169,25 @@ export const useTaskStore = create<TaskStore>()(
         if (!task) return
 
         const newFormData = payload || task.formData
-        await generateNote({
-          ...newFormData,
-          task_id: id,
-        })
+        try {
+          await generateNote({
+            ...newFormData,
+            task_id: id,
+          })
+        } catch (e: any) {
+          // 就绪门禁：转写模型未下载好。不要把任务标成 PENDING（会一直转），
+          // 给提示让用户先去下载。
+          if (e?.data?.reason === 'transcriber_model_not_ready') {
+            toast.error(
+              e?.data?.downloading
+                ? '转写模型正在下载中，请稍候再重试'
+                : '转写模型尚未下载，请先去「设置 → 音频转写配置」页下载',
+            )
+            return
+          }
+          console.error('重试任务失败：', e)
+          return
+        }
 
         set(state => ({
           tasks: state.tasks.map(t =>
@@ -211,6 +227,18 @@ export const useTaskStore = create<TaskStore>()(
     }),
     {
       name: 'task-storage',
+      storage: createJSONStorage(() => ({
+        getItem: async (name: string): Promise<string | null> => {
+          const value = await get(name)
+          return value ?? null
+        },
+        setItem: async (name: string, value: string): Promise<void> => {
+          await set(name, value)
+        },
+        removeItem: async (name: string): Promise<void> => {
+          await del(name)
+        },
+      })),
     }
   )
 )

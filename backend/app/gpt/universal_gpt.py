@@ -53,20 +53,26 @@ class UniversalGPT(GPT):
             extras=kwargs.get('extras'),
         )
 
-        # ⛳ 组装 content 数组，支持 text + image_url 混合
-        content: List[dict] = [{"type": "text", "text": content_text}]
         video_img_urls = kwargs.get('video_img_urls', [])
 
-        for url in video_img_urls:
-            content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": url,
-                    "detail": "auto"
-                }
-            })
+        content: list[dict] | str
+        if video_img_urls:
+            # 有截图时走 OpenAI 多模态 content 数组（text + image_url）
+            content = [{"type": "text", "text": content_text}]
+            for url in video_img_urls:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": url,
+                        "detail": "auto"
+                    }
+                })
+        else:
+            # 纯文本场景退回 string content：DeepSeek deepseek-chat 等非多模态模型
+            # 不识别 [{"type":"text",...}] 数组形态，会返回 invalid_request_error
+            # （issue #282）。OpenAI 规范本身也允许 content 为 string。
+            content = content_text
 
-        #  正确格式：整体包在一个 message 里，role + content array
         messages = [{
             "role": "user",
             "content": content
@@ -83,9 +89,10 @@ class UniversalGPT(GPT):
 
     def _build_merge_messages(self, partials: list) -> list:
         merge_text = MERGE_PROMPT + "\n\n" + "\n\n---\n\n".join(partials)
+        # 合并阶段没有图片，直接用 string content 兼容非多模态模型（issue #282）
         return [{
             "role": "user",
-            "content": [{"type": "text", "text": merge_text}]
+            "content": merge_text
         }]
 
     def _checkpoint_path(self, checkpoint_key: str) -> Path:
@@ -178,15 +185,40 @@ class UniversalGPT(GPT):
         status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
         return status in {408, 409, 429, 500, 502, 503, 504, 524}
 
+    @staticmethod
+    def _is_temperature_unsupported_error(exc: Exception) -> bool:
+        """OpenAI o1/o3/gpt-5 系列等新模型不接受自定义 temperature，
+        只允许默认值 1，传 0.7 会报 `'temperature' does not support 0.7 ...`。"""
+        raw = str(exc).lower()
+        return "temperature" in raw and (
+            "does not support" in raw
+            or "unsupported_value" in raw
+            or "only the default" in raw
+        )
+
+    def _do_create(self, messages: list):
+        """单次调用。如果模型拒绝自定义 temperature，就地去掉该参数再试一次
+        （不消耗外层的重试次数预算），仍失败则把异常抛给外层重试逻辑。"""
+        try:
+            return self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=self.temperature,
+            )
+        except Exception as exc:
+            if self._is_temperature_unsupported_error(exc):
+                print(f"[universal_gpt] 模型 {self.model} 不支持自定义 temperature，改用默认值重试")
+                return self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                )
+            raise
+
     def _chat_completion_create(self, messages: list):
         last_exc = None
         for attempt in range(self._max_retry_attempts):
             try:
-                return self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=self.temperature
-                )
+                return self._do_create(messages)
             except Exception as exc:
                 last_exc = exc
                 if attempt == self._max_retry_attempts - 1 or not self._is_retryable_error(exc):

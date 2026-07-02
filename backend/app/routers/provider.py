@@ -20,6 +20,8 @@ class ProviderRequest(BaseModel):
 
 class TestRequest(BaseModel):
     id: str
+    # 可选：指定用哪个 model 跑连通性测试；不传则用该 provider 在 DB 里的第一个模型
+    model: Optional[str] = None
 class ProviderUpdateRequest(BaseModel):
     id: str
     name: Optional[str] = None
@@ -77,16 +79,19 @@ def update_provider(data: ProviderUpdateRequest):
         ):
             return R.error(msg='请至少填写一个参数')
 
-        provider_id =ProviderService.update_provider(
+        updated_provider =ProviderService.update_provider(
             id=data.id,
             data=dict(data)
         )
-        return R.success(msg='更新模型供应商成功',data={'id': provider_id})
+        if updated_provider:
+            return R.success(msg='更新模型供应商成功', data=updated_provider)
+        else:
+            return R.error(msg='更新模型供应商失败')
     except Exception as e:
         print(e)
         return R.error(msg=str(e))
 
 @router.post('/connect_test')
 def gpt_connect_test(data: TestRequest):
-    ModelService().connect_test(data.id)
+    ModelService().connect_test(data.id, model=data.model)
     return R.success(msg='连接成功')
